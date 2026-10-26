@@ -1,0 +1,434 @@
+"""
+neaps_qdrant_store.py
+=====================
+Qdrant vector store for NEAPS documents using NAMED VECTORS.
+
+Collection: NEAPS_QDRANT_COLLECTION (env, default 'neaps_docs')
+
+Named vectors:
+  dense   1024-dim COSINE (BAAI/bge-large-en-v1.5)
+  sparse  Qdrant sparse vector (BM25 indices + values)
+
+All connection settings are read from .env via settings:
+  QDRANT_HOST, QDRANT_PORT (shared with main app)
+  NEAPS_QDRANT_COLLECTION
+
+Payload schema:
+  ann_seq         NUMBER  (indexed for range/exact filter)
+  company_symbol  TEXT    (indexed for match filter)
+  company_id      TEXT    (alias for company_symbol)
+  ann_date        TEXT
+  ann_date_ts     NUMBER  (unix timestamp, for date range filters)
+  file_name       TEXT
+  text            TEXT    (chunk text)
+  chunk_index     NUMBER
+  source_type     TEXT    = 'neaps_document'
+  active          BOOL    (soft-delete flag)
+  ingestion_time  TEXT    (ISO-8601)
+"""
+
+import logging
+import hashlib
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    HnswConfigDiff,
+    NamedVector,
+    NamedSparseVector,
+    PointStruct,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+    VectorsConfig,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    MatchAny,
+    Range,
+    SearchParams,
+    SparseIndexParams,
+)
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+HNSW_M           = 32
+HNSW_EF_CONSTRUCT = 200
+HNSW_EF_SEARCH   = 128
+VECTOR_VERSION   = "1.0"
+
+DENSE_NAME  = "dense"
+SPARSE_NAME = "sparse"
+
+
+class NeapsQdrantStore:
+    """
+    Qdrant wrapper for neaps_docs collection with dense + sparse named vectors.
+    """
+
+    def __init__(self) -> None:
+        self.host            = settings.qdrant_host
+        self.port            = settings.qdrant_port
+        self.collection_name = settings.neaps_qdrant_collection
+        self.dimension       = settings.embedding_dimension
+
+        # Increased timeout to 120.0 to prevent 'times out' errors during heavy load
+        self.client = QdrantClient(host=self.host, port=self.port, timeout=120.0)
+        self._ensure_collection()
+        logger.info(
+            f"[NeapsQdrantStore] Ready  collection='{self.collection_name}' "
+            f"host={self.host}:{self.port}"
+        )
+
+    # ------------------------------------------------------------------
+    # Collection bootstrap
+    # ------------------------------------------------------------------
+
+    def _ensure_collection(self) -> None:
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.collection_name in existing:
+            logger.info(f"[NeapsQdrantStore] Collection '{self.collection_name}' already exists.")
+            return
+
+        logger.info(f"[NeapsQdrantStore] Creating collection '{self.collection_name}' ")
+
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config={
+                DENSE_NAME: VectorParams(
+                    size=self.dimension,
+                    distance=Distance.COSINE,
+                    hnsw_config=HnswConfigDiff(
+                        m=HNSW_M,
+                        ef_construct=HNSW_EF_CONSTRUCT,
+                    ),
+                ),
+            },
+            sparse_vectors_config={
+                SPARSE_NAME: SparseVectorParams(
+                    index=SparseIndexParams(on_disk=False),
+                ),
+            },
+        )
+        logger.info(
+            f"[NeapsQdrantStore] Collection '{self.collection_name}' created  "
+            f"dense dim={self.dimension}, sparse BM25."
+        )
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def upsert_chunks(
+        self,
+        chunks: List[Dict[str, Any]],
+        hybrid_embeddings: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        Upsert enriched chunks with their hybrid embeddings.
+
+        Args:
+            chunks:            List of {'text': ..., 'metadata': {...}} dicts
+                               (output of neaps_metadata_enrichment.enrich_chunks).
+            hybrid_embeddings: List of {'dense': np.ndarray, 'sparse': {...}}
+                               (output of neaps_hybrid_embedder.embed_chunks_hybrid).
+
+        Returns:
+            List of generated point UUIDs.
+        """
+        if len(chunks) != len(hybrid_embeddings):
+            raise ValueError("chunks and hybrid_embeddings must have the same length")
+
+        now_iso = datetime.now().isoformat()
+        points: List[PointStruct] = []
+        ids: List[str] = []
+
+        for chunk, emb in zip(chunks, hybrid_embeddings):
+            meta = dict(chunk.get("metadata", {}))
+            
+            # Generate deterministic point ID for idempotent upserts
+            ann_seq = str(meta.get("ann_seq", "0"))
+            chunk_idx = str(meta.get("chunk_index", "0"))
+            
+            # Use uuid5-based deterministic ID for fallback, matching neaps_ingestion_service
+            fallback_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"neaps_{ann_seq}_chunk_{chunk_idx}"))
+            
+            # Use the pre-assigned chunk_id if present, else fallback to the uuid5 ID
+            point_id = meta.get("chunk_id") or fallback_id
+            ids.append(point_id)
+
+            meta["text"]           = chunk.get("text", "")
+            meta["ingestion_time"] = now_iso
+            meta["vector_version"] = VECTOR_VERSION
+            meta.setdefault("active", True)
+            meta["chunk_id"] = point_id
+
+            dense_vec  = emb["dense"]
+            sparse_raw = emb["sparse"]
+
+            points.append(
+                PointStruct(
+                    id=point_id,
+                    vector={
+                        DENSE_NAME: dense_vec.tolist(),
+                        SPARSE_NAME: SparseVector(
+                            indices=sparse_raw.get("indices", []),
+                            values=sparse_raw.get("values", []),
+                        ),
+                    },
+                    payload=meta,
+                )
+            )
+
+        # Batch upserts (Qdrant gets unhappy with massive single-payload requests)
+        batch_size = 500
+        for i in range(0, len(points), batch_size):
+            batch = points[i : i + batch_size]
+            self.client.upsert(collection_name=self.collection_name, points=batch)
+
+        logger.info(
+            f"[NeapsQdrantStore] Upserted {len(points)} chunks into '{self.collection_name}' (in batches of {batch_size})"
+        )
+        return ids
+
+    # ------------------------------------------------------------------
+    # Deduplication helpers
+    # ------------------------------------------------------------------
+
+    def ann_seq_exists(self, ann_seq: int) -> bool:
+        """Return True if any chunk for this ann_seq is already indexed."""
+        try:
+            results = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(key="ann_seq", match=MatchValue(value=ann_seq))
+                    ]
+                ),
+                limit=1,
+                with_payload=False,
+                with_vectors=False,
+            )
+            return len(results[0]) > 0
+        except Exception as exc:
+            logger.error(f"[NeapsQdrantStore] ann_seq_exists failed: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def search_dense(
+        self,
+        query_dense: np.ndarray,
+        company_symbol: Optional[str] = None,
+        top_k: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Dense vector search with optional company filter."""
+        try:
+            # Use must_not=active:False so chunks without the 'active' field
+            # (ingested before soft-delete was added) are NOT filtered out.
+            # Only explicitly soft-deleted chunks (active=False) are excluded.
+            must_not_conditions = [FieldCondition(key="active", match=MatchValue(value=False))]
+            must_conditions = []
+            if company_symbol:
+                if isinstance(company_symbol, dict) and "$in" in company_symbol:
+                    symbols = [str(s).upper() for s in (company_symbol["$in"] or []) if s]
+                    if len(symbols) == 1:
+                        must_conditions.append(FieldCondition(key="company_symbol", match=MatchValue(value=symbols[0])))
+                    elif len(symbols) > 1:
+                        must_conditions.append(FieldCondition(key="company_symbol", match=MatchAny(any=symbols)))
+                elif isinstance(company_symbol, list):
+                    symbols = [str(s).upper() for s in company_symbol if s]
+                    if symbols:
+                        must_conditions.append(FieldCondition(key="company_symbol", match=MatchAny(any=symbols)))
+                elif isinstance(company_symbol, str):
+                    must_conditions.append(
+                        FieldCondition(key="company_symbol", match=MatchValue(value=company_symbol.upper()))
+                    )
+
+            results = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=NamedVector(name=DENSE_NAME, vector=query_dense.tolist()),
+                query_filter=Filter(
+                    must=must_conditions if must_conditions else None,
+                    must_not=must_not_conditions,
+                ),
+                limit=top_k,
+                with_payload=True,
+                search_params=SearchParams(hnsw_ef=HNSW_EF_SEARCH),
+            )
+            return self._format(results, source="dense")
+        except Exception as exc:
+            logger.error(f"[NeapsQdrantStore] search_dense failed: {exc}")
+            return []
+
+    def search_sparse(
+        self,
+        query_sparse: Dict[str, Any],
+        company_symbol: Optional[str] = None,
+        top_k: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Sparse (BM25) vector search with optional company filter."""
+        try:
+            # Same logic as search_dense: exclude only explicitly soft-deleted chunks
+            must_not_conditions = [FieldCondition(key="active", match=MatchValue(value=False))]
+            must_conditions = []
+            if company_symbol:
+                if isinstance(company_symbol, dict) and "$in" in company_symbol:
+                    symbols = [str(s).upper() for s in (company_symbol["$in"] or []) if s]
+                    if len(symbols) == 1:
+                        must_conditions.append(FieldCondition(key="company_symbol", match=MatchValue(value=symbols[0])))
+                    elif len(symbols) > 1:
+                        must_conditions.append(FieldCondition(key="company_symbol", match=MatchAny(any=symbols)))
+                elif isinstance(company_symbol, list):
+                    symbols = [str(s).upper() for s in company_symbol if s]
+                    if symbols:
+                        must_conditions.append(FieldCondition(key="company_symbol", match=MatchAny(any=symbols)))
+                elif isinstance(company_symbol, str):
+                    must_conditions.append(
+                        FieldCondition(key="company_symbol", match=MatchValue(value=company_symbol.upper()))
+                    )
+
+            results = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=NamedSparseVector(
+                    name=SPARSE_NAME,
+                    vector=SparseVector(
+                        indices=query_sparse.get("indices", []),
+                        values=query_sparse.get("values", []),
+                    ),
+                ),
+                query_filter=Filter(
+                    must=must_conditions if must_conditions else None,
+                    must_not=must_not_conditions,
+                ),
+                limit=top_k,
+                with_payload=True,
+            )
+            return self._format(results, source="sparse")
+        except Exception as exc:
+            logger.error(f"[NeapsQdrantStore] search_sparse failed: {exc}")
+            return []
+
+    @staticmethod
+    def _format(results, source: str) -> List[Dict[str, Any]]:
+        out = []
+        for hit in results:
+            payload = dict(hit.payload or {})
+            out.append(
+                {
+                    "id"        : str(hit.id),
+                    "score"     : float(hit.score),
+                    "text"      : payload.pop("text", ""),
+                    "metadata"  : payload,
+                    "source"    : source,
+                    "source_type": payload.get("source_type", "neaps_document"),
+                }
+            )
+        return out
+
+    # ------------------------------------------------------------------
+    # Full Description Stitching
+    # ------------------------------------------------------------------
+
+    def fetch_full_descriptions(self, ann_seqs: List[str]) -> Dict[str, str]:
+        """
+        Scroll Qdrant for all chunks of requested announcements, sort by chunk_index,
+        and stitch into full text.
+        ann_seqs can contain either ann_seq or file_name as a fallback identifier.
+        """
+        result: Dict[str, str] = {}
+        for seq in ann_seqs:
+            if not seq:
+                continue
+            try:
+                all_chunks = []
+                offset = None
+                while True:
+                    # Search by ann_seq or file_name since we might fallback to file_name
+                    points, next_offset = self.client.scroll(
+                        collection_name=self.collection_name,
+                        scroll_filter=Filter(should=[
+                            FieldCondition(key="ann_seq", match=MatchValue(value=seq)),
+                            FieldCondition(key="file_name", match=MatchValue(value=seq))
+                        ]),
+                        limit=100,
+                        offset=offset,
+                        with_payload=True,
+                    )
+                    all_chunks.extend(points)
+                    offset = next_offset
+                    if not points or offset is None:
+                        break
+
+                if not all_chunks:
+                    logger.debug(f"[NeapsQdrantStore] No chunks found for id={seq}")
+                    result[seq] = ""
+                    continue
+
+                # Sort by chunk_index
+                all_chunks.sort(key=lambda p: (p.payload or {}).get("chunk_index", 0))
+                
+                # Stitch text
+                full_text = " ".join(
+                    (p.payload or {}).get("text") or (p.payload or {}).get("chunk_text", "")
+                    for p in all_chunks
+                )
+                result[seq] = full_text
+                
+                logger.debug(
+                    f"[NeapsQdrantStore] Stitched {len(all_chunks)} chunks "
+                    f"({len(full_text)} chars) for id={seq}"
+                )
+
+            except Exception as exc:
+                logger.warning(f"[NeapsQdrantStore] fetch_full_descriptions failed for id={seq}: {exc}")
+                result[seq] = ""
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    def get_collection_info(self) -> Dict[str, Any]:
+        try:
+            total = self.client.count(collection_name=self.collection_name).count
+            active = self.client.count(
+                collection_name=self.collection_name,
+                count_filter=Filter(
+                    must=[FieldCondition(key="active", match=MatchValue(value=True))]
+                ),
+            ).count
+            return {
+                "collection": self.collection_name,
+                "total_vectors": total,
+                "active_vectors": active,
+                "dimension": self.dimension,
+                "named_vectors": [DENSE_NAME, SPARSE_NAME],
+                "status": "active",
+            }
+        except Exception as exc:
+            logger.error(f"[NeapsQdrantStore] get_collection_info failed: {exc}")
+            return {"collection": self.collection_name, "status": "error"}
+
+
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+_store: Optional[NeapsQdrantStore] = None
+
+
+def get_neaps_qdrant_store() -> NeapsQdrantStore:
+    """Get or create the NeapsQdrantStore singleton."""
+    global _store
+    if _store is None:
+        _store = NeapsQdrantStore()
+    return _store

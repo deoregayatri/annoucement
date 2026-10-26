@@ -1,0 +1,614 @@
+"""
+Centralized configuration management using Pydantic Settings.
+All paths and settings loaded from .env file.
+"""
+
+from pathlib import Path
+from typing import Literal
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+
+class Settings(BaseSettings):
+    """
+    Application settings loaded from environment variables.
+    All paths are configurable via .env file.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+    )
+
+    # ============== PATHS ==============
+    models_dir: Path = Field(
+        default=Path("models"),
+        description="Directory containing local models (relative to project root or absolute via .env)",
+    )
+
+    sqlite_db_path: Path = Field(
+        default=Path("database/vocabulary.db"),
+        description="SQLite database path for vocabulary storage",
+    )
+
+    bm25_index_path: Path = Field(
+        default=Path("indexes/bm25_index.pkl"),
+        description="BM25 index pickle file path",
+    )
+
+    documents_dir: Path = Field(
+        default=Path("data/documents"), description="Directory for document storage"
+    )
+
+    document_root: str = Field(
+        default="",
+        description="Root directory for downloadable documents (set DOCUMENT_ROOT in .env)",
+    )
+
+    log_dir: Path = Field(default=Path("logs"), description="Directory for log files")
+
+    webexcel_data_dir: str = Field(
+        default="",
+        description=(
+            "Root folder for weekly Excel feeds. "
+            "Week subfolders (e.g. 23-02-2026_to_27-02-2026) are scanned automatically. "
+            "REQUIRED: set WEBEXCEL_DATA_DIR in .env or pass --dir to ingest_excel.py."
+        ),
+    )
+
+    # ============== VECTOR DATABASE ==============
+    qdrant_host: str = Field(default="localhost", description="Qdrant host")
+    qdrant_port: int = Field(default=6333, description="Qdrant port")
+    qdrant_collection: str = Field(
+        default="knowledge_base", description="Qdrant collection name"
+    )
+
+    # ============== EMBEDDING MODEL ==============
+    # Local models (optional)
+    embedding_model_name: str = Field(
+        default="BAAI/bge-large-en-v1.5", description="Embedding model name"
+    )
+
+    embedding_model_path: Path = Field(
+        default=Path("models/bge-large-en-v1.5"),
+        description="Local path to embedding model (relative to project root or absolute via .env)",
+    )
+
+    # OpenRouter embeddings
+    use_openrouter_embeddings: bool = Field(
+        default=False, description="Use OpenRouter for embeddings"
+    )
+
+    openrouter_embedding_model: str = Field(
+        default="mistralai/mistral-embed", description="OpenRouter embedding model"
+    )
+
+    embedding_dimension: int = Field(
+        default=1024, description="Embedding vector dimension"
+    )
+
+    embedding_batch_size: int = Field(
+        default=32, description="Batch size for embedding generation"
+    )
+
+    # ============== RERANKER MODEL ==============
+    reranker_model_name: str = Field(
+        default="BAAI/bge-reranker-v2-m3", description="Reranker model name"
+    )
+
+    reranker_model_path: Path = Field(
+        default=Path("models/bge-reranker-v2-m3"),
+        description="Local path to reranker model (relative to project root or absolute via .env)",
+    )
+
+    use_reranker: bool = Field(
+        default=True, description="Enable reranking in retrieval pipeline"
+    )
+
+    reranker_batch_size: int = Field(default=32, description="Batch size for reranking")
+
+    # ============== RETRIEVAL SETTINGS ==============
+    weight_vector: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Weight for vector similarity in score fusion",
+    )
+
+    weight_bm25: float = Field(
+        default=0.3, ge=0.0, le=1.0, description="Weight for BM25 score in score fusion"
+    )
+
+    weight_dictionary: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description="Weight for dictionary boost in score fusion",
+    )
+
+    top_k_retrieval: int = Field(
+        default=20, description="Number of results to retrieve before reranking"
+    )
+
+    top_k_rerank: int = Field(
+        default=10, description="Number of results after reranking"
+    )
+
+    top_k_final: int = Field(default=5, description="Final number of results to return")
+
+    # ============== LLM ==============
+    use_ollama: bool = Field(default=False, description="Use Ollama for LLM tasks")
+
+    ollama_base_url: str = Field(
+        default="http://localhost:11434", description="Ollama API base URL"
+    )
+
+    ollama_model_vocab_extraction: str = Field(
+        default="mistral:7b-instruct",
+        description="Ollama model for vocabulary extraction",
+    )
+
+    ollama_model_search: str = Field(
+        default="mistral:7b-instruct", description="Ollama model for search/answering"
+    )
+
+    ollama_model_answer: str = Field(
+        default="mistral:7b-instruct", description="Ollama model for answer generation"
+    )
+
+    ollama_model_vision: str = Field(
+        default="minicpm-v:latest",
+        description="Ollama vision model for image processing",
+    )
+
+    # LLM runtime parameters (all configurable from .env)
+    ollama_num_ctx: int = Field(
+        default=8192,
+        description="Ollama context window size (tokens). Set OLLAMA_NUM_CTX in .env.",
+    )
+    ollama_num_predict: int = Field(
+        default=1024,
+        description="Max tokens for LLM answer output. Caps generation length. Set OLLAMA_NUM_PREDICT in .env.",
+    )
+    ollama_timeout: float = Field(
+        default=120.0,
+        description="Timeout in seconds for Ollama LLM requests. Set OLLAMA_TIMEOUT in .env.",
+    )
+    akamai_heartbeat_interval_s: float = Field(
+        default=30.0,
+        description=(
+            "Seconds between heartbeat whitespace bytes sent to keep Akamai's "
+            "5-minute idle-connection timeout from firing during long LLM generation. "
+            "Set AKAMAI_HEARTBEAT_INTERVAL_S in .env. Recommended: 30."
+        ),
+    )
+    ollama_temperature_answer: float = Field(
+        default=0.6,
+        description="LLM temperature for answer/RAG generation. Set OLLAMA_TEMPERATURE_ANSWER in .env.",
+    )
+    ollama_temperature_vocab: float = Field(
+        default=0.1,
+        description="LLM temperature for vocabulary extraction (low = precise). Set OLLAMA_TEMPERATURE_VOCAB in .env.",
+    )
+    ollama_temperature_neaps: float = Field(
+        default=0.3,
+        description="LLM temperature for NEAPS answer generation. Set OLLAMA_TEMPERATURE_NEAPS in .env.",
+    )
+    enable_adaptive_retry: bool = Field(
+        default=False,
+        description=(
+            "Enable adaptive retry in AnswerGenerator: if first LLM answer has confidence < 0.5, "
+            "retry with 20 chunks. DISABLED by default — on CPU-bound models (qwen3:30b) each "
+            "retry adds 30–90s and risks exceeding Akamai's 5-minute timeout. "
+            "Set ENABLE_ADAPTIVE_RETRY=true in .env only if LLM response time is reliably < 90s."
+        ),
+    )
+
+    # Qdrant collection names (configurable from .env)
+    qdrant_json_collection: str = Field(
+        default="announcements_json",
+        description="Qdrant collection for JSON/URL/Excel chunks. Set QDRANT_JSON_COLLECTION in .env.",
+    )
+    qdrant_docs_collection: str = Field(
+        default="announcements_docs",
+        description="Qdrant collection for PDF/DOCX/TXT chunks. Set QDRANT_DOCS_COLLECTION in .env.",
+    )
+
+    # ============== EXTERNAL FETCH API ==============
+    nse_article_fetch_url: str = Field(
+        default="https://reg.nseindia.com/api/fetch-article",
+        description=(
+            "POST endpoint used to retrieve article content from a URL. "
+            'Body: {"url": "<article url>"}. '
+            "Override via NSE_ARTICLE_FETCH_URL in .env."
+        ),
+    )
+
+    # ============== QUERY EXPANSION ==============
+    enable_query_expansion: bool = Field(
+        default=True, description="Enable query expansion"
+    )
+
+    skip_query_expansion: bool = Field(
+        default=False, description="Skip query expansion"
+    )
+
+    min_confidence_threshold: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence for query expansion",
+    )
+
+    enable_parallel_chunk_processing: bool = Field(
+        default=True, description="Enable parallel chunk processing"
+    )
+
+    max_workers: int = Field(
+        default=8, description="Max worker threads for parallel processing"
+    )
+
+    # ============== BACKGROUND WORKERS ==============
+    worker_poll_interval_s: int = Field(
+        default=5, description="Seconds between job queue polls"
+    )
+    worker_lock_timeout_s: int = Field(
+        default=259200, description="Seconds before a locked job is considered stale"
+    )
+    worker_heartbeat_interval_s: int = Field(
+        default=300, description="Seconds between active worker heartbeat pulses"
+    )
+    worker_heartbeat_timeout_s: int = Field(
+        default=900, description="Seconds without a heartbeat before job is requeued"
+    )
+    worker_max_retries: int = Field(
+        default=3, description="Maximum number of retries for a job"
+    )
+
+    # ============== EUREKA REGISTRY ==============
+    eureka_server_url: str = Field(
+        default="http://172.17.51.211:8088/eureka",
+        description="Eureka Server URL. Set EUREKA_SERVER_URL in .env."
+    )
+    eureka_app_name: str = Field(
+        default="announcement-service",
+        description="Eureka Application Name. Set EUREKA_APP_NAME in .env."
+    )
+    eureka_instance_ip: str = Field(
+        default="172.17.177.78",
+        description="Eureka Instance IP. Set EUREKA_INSTANCE_IP in .env."
+    )
+    
+
+    # ============== API SETTINGS ==============
+    api_host: str = Field(default="0.0.0.0", description="API host")
+    api_port: int = Field(default=8081, description="API port")
+    api_reload: bool = Field(default=True, description="Enable auto-reload")
+    
+    # ============== CONTENT TYPE SUPPORT ==============
+    default_content_type: Literal[
+        "general",
+        "financial_doc",
+        "loan_application",
+        "policy",
+        "communication",
+        "transaction",
+    ] = Field(default="general", description="Default content type")
+
+    # ============== LOGGING ==============
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
+        default="INFO", description="Logging level"
+    )
+
+    log_format: Literal["json", "text"] = Field(
+        default="json", description="Log output format"
+    )
+
+    # ============== CACHE SETTINGS ==============
+    enable_memory_cache: bool = Field(
+        default=True, description="Enable in-memory caching"
+    )
+
+    cache_max_size: int = Field(default=1000, description="Maximum cache entries")
+
+    cache_ttl_seconds: int = Field(
+        default=3600, description="Cache time-to-live in seconds"
+    )
+
+    # ============== DOCUMENT PROCESSING ==============
+    chunk_size: int = Field(
+        default=350, description="Text chunk size in tokens/characters"
+    )
+
+    chunk_overlap: int = Field(
+        default=50, description="Overlap between chunks in tokens/characters"
+    )
+
+    max_file_size_mb: int = Field(
+        default=10, description="Maximum file size for uploads in MB"
+    )
+
+    allowed_extensions: str = Field(
+        default="pdf,docx,txt",
+        description="Comma-separated list of allowed file extensions",
+    )
+
+    # ============== ANSWER GENERATION ==============
+    use_answer_generation: bool = Field(
+        default=True, description="Enable LLM-based answer generation"
+    )
+
+    min_answer_confidence: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence to show generated answer",
+    )
+
+    max_context_length: int = Field(
+        default=4000, description="Maximum context length for answer generation"
+    )
+
+    answer_temperature: float = Field(
+        default=0.3, ge=0.0, le=2.0, description="Temperature for answer generation"
+    )
+
+    # ============== OCR SETTINGS ==============
+    use_ocr: bool = Field(default=True, description="Enable OCR for scanned documents")
+
+    ocr_engine: str = Field(
+        default="tesseract", description="OCR engine (tesseract or easyocr)"
+    )
+
+    tesseract_path: str = Field(
+        default="", description="Path to Tesseract executable (Windows)"
+    )
+
+    ocr_language: str = Field(default="eng", description="OCR language code")
+
+    min_text_threshold: int = Field(
+        default=100, description="Minimum characters before trying OCR"
+    )
+
+    vision_min_image_size: int = Field(
+        default=100, description="Minimum image width/height (px) for vision extraction"
+    )
+
+    vision_max_images_per_page: int = Field(
+        default=10, description="Maximum number of images processed per PDF page"
+    )
+
+    # Legacy vision LLM (Ollama - NOW ACTIVE for minicpm-v)
+    use_vision_llm: bool = Field(
+        default=True, description="Legacy: Enable Ollama vision LLM (minicpm-v)"
+    )
+
+    vision_llm_model: str = Field(
+        default="minicpm-v:latest", description="Legacy Ollama vision model"
+    )
+
+    # ============== VLM CONCURRENCY (separate from text LLM) ==============
+    # Total concurrency = vlm_server_count   vlm_max_concurrency_per_server
+    vlm_server_count: int = Field(
+        default=1,
+        description="Number of VLM Ollama server nodes (set VLM_SERVER_COUNT in .env)",
+    )
+    vlm_max_concurrency_per_server: int = Field(
+        default=1,
+        description="Max concurrent VLM requests per server (set VLM_MAX_CONCURRENCY_PER_SERVER in .env)",
+    )
+    vlm_request_timeout_s: float = Field(
+        default=120.0,
+        description="Per-attempt timeout for VLM requests in seconds (set VLM_REQUEST_TIMEOUT_S in .env)",
+    )
+    vlm_max_retries: int = Field(
+        default=2,
+        description="Max retry attempts for a failed VLM call (set VLM_MAX_RETRIES in .env)",
+    )
+    vlm_image_min_size: int = Field(
+        default=64,
+        description="Skip images smaller than this (px) on either axis (set VLM_IMAGE_MIN_SIZE in .env)",
+    )
+    vlm_image_max_dim: int = Field(
+        default=1024,
+        description="Resize cap for images sent to VLM (set VLM_IMAGE_MAX_DIM in .env)",
+    )
+    vlm_images_per_request: int = Field(
+        default=1,
+        description="Max images per VLM API call, 1-3 (set VLM_IMAGES_PER_REQUEST in .env)",
+    )
+    vlm_enabled: bool = Field(
+        default=True,
+        description="Enable VLM image processing during PDF ingestion (set VLM_ENABLED in .env)",
+    )
+
+    oracle_user: str = Field(
+        default="", description="Oracle DB username (leave empty to disable tracking)"
+    )
+
+    oracle_password: str = Field(default="", description="Oracle DB password")
+
+    oracle_dsn: str = Field(
+        default="", description="Oracle DB DSN, e.g. localhost:1521/XEPDB1"
+    )
+
+    oracle_thick_mode: bool = Field(
+        default=False,
+        description=(
+            "Enable oracledb thick mode. REQUIRED when Oracle server uses "
+            "Native Network Encryption (NNE) - typical on corporate instances. "
+            "Requires Oracle Instant Client to be installed on the server."
+        ),
+    )
+
+    oracle_client_lib_dir: str = Field(
+        default="",
+        description=(
+            "Path to Oracle Instant Client lib directory for thick mode. "
+            "Leave empty to auto-detect from PATH / LD_LIBRARY_PATH."
+        ),
+    )
+
+    # ============== JOB QUEUE WORKER (replaces Celery/Redis) ==============
+    max_workers_io: int = Field(
+        default=4,
+        description="Max threads for I/O-bound jobs (json_fetch, excel_ingestion)",
+    )
+
+    max_workers_cpu: int = Field(
+        default=2, description="Max processes for CPU-heavy jobs (document_ingestion)"
+    )
+
+    # ============== NEAPS INGESTION PIPELINE ==============
+
+    # Report & Email
+    neaps_report_dir: str = Field(
+        default="/mnt/Announcement/backend/files_info",
+        description="Directory to save per-symbol ingestion report .txt files",
+    )
+    neaps_report_email_to: str = Field(
+        default="",
+        description="Comma-separated email recipients for ingestion reports (NEAPS_REPORT_EMAIL_TO in .env)",
+    )
+    neaps_report_email_enabled: bool = Field(
+        default=True,
+        description="Enable/disable post-ingestion email reports (NEAPS_REPORT_EMAIL_ENABLED in .env)",
+    )
+    neaps_report_retention_days: int = Field(
+        default=45,
+        description="Auto-delete report files older than this many days (NEAPS_REPORT_RETENTION_DAYS in .env)",
+    )
+
+    # SFTP - NEAPS server
+    neaps_sftp_host: str = Field(
+        default="", description="NEAPS SFTP server host (set NEAPS_SFTP_HOST in .env)"
+    )
+    neaps_sftp_port: int = Field(default=22, description="NEAPS SFTP server port")
+    neaps_sftp_user: str = Field(
+        default="", description="NEAPS SFTP username (set NEAPS_SFTP_USER in .env)"
+    )
+    neaps_sftp_password: str = Field(
+        default="", description="NEAPS SFTP password (set NEAPS_SFTP_PASSWORD in .env)"
+    )
+    neaps_sftp_pkey_path: str = Field(
+        default="",
+        description="Path to SSH private key file for NEAPS SFTP auth (set NEAPS_SFTP_PKEY_PATH in .env). "
+                    "Takes precedence over password auth when set.",
+    )
+    neaps_sftp_pkey_passphrase: str = Field(
+        default="",
+        description="Passphrase for the SSH private key (set NEAPS_SFTP_PKEY_PASSPHRASE in .env). "
+                    "Leave empty if the key has no passphrase.",
+    )
+    neaps_sftp_remote_base: str = Field(
+        default="",
+        description="Remote base path for documents on NEAPS server (set NEAPS_SFTP_REMOTE_BASE in .env)",
+    )
+    neaps_sftp_workers: int = Field(
+        default=4, description="Parallel SFTP download threads"
+    )
+
+    # Local storage on AI UAT server
+    neaps_local_storage: str = Field(
+        default="",
+        description="Local directory to store downloaded NEAPS documents (set NEAPS_LOCAL_STORAGE in .env)",
+    )
+
+    # Oracle DB - NEAPSDBA (metadata source)
+    neaps_oracle_user: str = Field(
+        default="",
+        description="NEAPS Oracle DB username (set NEAPS_ORACLE_USER in .env)",
+    )
+    neaps_oracle_password: str = Field(
+        default="",
+        description="NEAPS Oracle DB password (set NEAPS_ORACLE_PASSWORD in .env)",
+    )
+    neaps_oracle_host: str = Field(
+        default="", description="NEAPS Oracle DB host (set NEAPS_ORACLE_HOST in .env)"
+    )
+    neaps_oracle_port: int = Field(default=1541, description="NEAPS Oracle DB port")
+    neaps_oracle_service: str = Field(
+        default="NEAPSDBA", description="NEAPS Oracle DB service name"
+    )
+    neaps_oracle_db_link: str = Field(
+        default="ANNDB",
+        description="Oracle DB-link name used in SQL queries (set ORACLE_DB_LINK in .env)",
+    )
+    neaps_oracle_table_name: str = Field(
+        default="Announcementss",
+        description="Main Oracle table name for announcements (set ORACLE_TABLE_NAME in .env)",
+    )
+    neaps_oracle_schema_name: str = Field(
+        default="",
+        description="Oracle schema prefix for table names (set ORACLE_SCHEMA_NAME in .env). Leave empty for default schema.",
+    )
+    neaps_oracle_thick_mode: bool = Field(
+        default=True,
+        description="Enable oracledb thick mode for NNE-encrypted Oracle (corp servers)",
+    )
+    neaps_oracle_client_lib_dir: str = Field(
+        default="",
+        description="Oracle Instant Client lib dir for thick mode (empty = auto-detect)",
+    )
+
+    # Qdrant collection for NEAPS documents
+    neaps_qdrant_collection: str = Field(
+        default="neaps_docs", description="Qdrant collection name for NEAPS documents"
+    )
+
+    # Document processing
+    neaps_chunk_size: int = Field(
+        default=1000, description="Chunk size for NEAPS documents (tokens/chars)"
+    )
+    neaps_chunk_overlap: int = Field(
+        default=200, description="Overlap between NEAPS chunks (tokens/chars)"
+    )
+
+    @property
+    def neaps_oracle_dsn(self) -> str:
+        """Construct Oracle DSN from host/port/service components."""
+        return f"{self.neaps_oracle_host}:{self.neaps_oracle_port}/{self.neaps_oracle_service}"
+
+    @field_validator("weight_vector", "weight_bm25", "weight_dictionary")
+    @classmethod
+    def validate_weights(cls, v, info):
+        """Ensure weights are between 0 and 1."""
+        if not 0 <= v <= 1:
+            raise ValueError(f"{info.field_name} must be between 0 and 1")
+        return v
+
+    def ensure_directories(self):
+        """Create necessary directories if they don't exist."""
+        directories = [
+            self.models_dir,
+            self.sqlite_db_path.parent,
+            self.bm25_index_path.parent,
+            self.documents_dir,
+            self.log_dir,
+        ]
+
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def validate_weights_sum(self) -> bool:
+        """Validate that retrieval weights sum to approximately 1.0."""
+        total = self.weight_vector + self.weight_bm25 + self.weight_dictionary
+        return abs(total - 1.0) < 0.01
+
+    @property
+    def is_query_expansion_enabled(self) -> bool:
+        """Check if query expansion is actually enabled."""
+        return self.enable_query_expansion and not self.skip_query_expansion
+
+
+# Global settings instance
+settings = Settings()
+
+# Ensure directories exist on import
+settings.ensure_directories()
+
+# Validate weights
+if not settings.validate_weights_sum():
+    print(
+        f"WARNING: Retrieval weights sum to "
+        f"{settings.weight_vector + settings.weight_bm25 + settings.weight_dictionary}, "
+        f"should sum to 1.0"
+    )
